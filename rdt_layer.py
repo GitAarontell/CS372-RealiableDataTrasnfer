@@ -1,5 +1,6 @@
 from segment import Segment
 import math
+import copy
 
 
 # #################################################################################################################### #
@@ -32,11 +33,20 @@ class RDTLayer(object):
     receiveChannel = None
     dataToSend = ''
     currentIteration = 0  # Use this for segment 'timeouts'
+    # used to count what bit we currently need to send, correlates to the index of string in dataToSend
     charCount = 0
+    # adds up data received when that data is a data segment
     dataReceived = ''
     countSegmentTimeouts = 0
     ackNum = 0
+    # used for holding segments that are not supposed to be received just yet when server is waiting for correct segment
     receivingListHistory = []
+    # shows the bit range we are currently at in the window
+    slidingWindow = [0, FLOW_CONTROL_WIN_SIZE - 1]
+    # holds the packets that are waiting for acknowledgment
+    awaitingAckSegments = []
+    # used to stop checking the range of sliding window when final data char indices are reached
+    lastCheck = False
 
     # Add items as needed
 
@@ -125,61 +135,97 @@ class RDTLayer(object):
     #                                                                                                                  #
     # ################################################################################################################ #
     def processSend(self):
+
+        # used so only the client uses this send to send data packets
         if len(self.dataToSend) == 0:
             return
-
+        print()
+        print("###############################################################################")
+        print("Client Process Send from Reliable Layer")
+        print("###############################################################################")
+        print()
         # ############################################################################################################ #
-        print('processSend(): Complete this...')
+        # this tracks the number of iterations of current segments in the sliding window
+        # and if the iterations reached 2, or whatever number you put in, then it will retransmit packets
+        # that have not yet been acknowledged.
+        for seg in self.awaitingAckSegments:
+            if self.currentIteration - seg.getStartDelayIteration() == 2:
+                self.countSegmentTimeouts += 1
+                seg.setStartDelayIteration(self.currentIteration)
+                copySeg = copy.deepcopy(seg)
+                print("### Re-Sending segment: ", seg.to_string())
+                self.sendChannel.send(copySeg)
 
-        # You should pipeline segments to fit the flow-control window
-        # The flow-control window is the constant RDTLayer.FLOW_CONTROL_WIN_SIZE
-        # The maximum data that you can send in a segment is RDTLayer.DATA_LENGTH
-        # These constants are given in # characters
-
-        # Somewhere in here you will be creating data segments to send.
-        # The data is just part of the entire string that you are trying to send.
-        # The seqNum is the sequence number for the segment (in character number, not bytes)
-
-        # calculate total chars left to send
-        charsLeftToSend = len(self.dataToSend) - self.charCount
-        # calculate packets based on the chars left to send and the data length constant
-        totalPacketsLeft = math.ceil(charsLeftToSend / self.DATA_LENGTH)
-        # segments to send is the rounded down flow control window size divided by the payout size
-        segmentsToSend = math.floor(self.FLOW_CONTROL_WIN_SIZE / self.DATA_LENGTH)
-        # if however, the total packets left is less than the current segments to send, then set segements to send
-        # to the total packets left. So basically, when there is less than 3 packets to send, total packets left will
-        # be either 1 or 2, and so that will be what segments to send is set to.
-        if totalPacketsLeft < segmentsToSend:
-            segmentsToSend = totalPacketsLeft
-
-        # pipline segments depending on the flow control window size and the data length constants
-        for p in range(segmentsToSend):
+        # if the sliding window is currently full or is waiting for ack's before it can move the sliding window
+        # up, then it will not send any packets
+        if self.charCount > self.slidingWindow[1]:
+            print("Sliding Window Currently Full Waiting for ACK's")
+        else:
+            # if there is space in the sliding window to send packets then it will
+            # this creats initial values to be used for the segment when we send
             segmentSend = Segment()
             data = ''
-            # set seqNum to index of first data being sent in packet
+            # add the char, at the self.charCount index in dataToSend, to the data variable
+            data += self.dataToSend[self.charCount]
+            # set sequence number to the current charCount which will start as 0
             seqNum = self.charCount
-            # if the index of charCount is ever equal to the len of data to send, then all data has been sent
-            # else continue to send data
-            if self.charCount < len(self.dataToSend):
-                # counter used to make sure each packet only gets a max of the data_length allowed per packet
-                counter = 0
-                # add rest of data after setting correct seqNum
-                while self.charCount < len(self.dataToSend):
-                    data += self.dataToSend[self.charCount]
-                    # increment charCount to keep track of what index char of data we are on
-                    # counter keeps track of how many char's we have sent within the limit of this packet size
-                    self.charCount += 1
-                    counter += 1
-                    if counter == self.DATA_LENGTH:
-                        break
+            # increment charCount to point at next char in data to send
+            self.charCount += 1
+            # counter used to know what current packet size is
+            counter = 1
 
-            # ######################################################################################################## #
-            # sets up segment with data
-            segmentSend.setData(seqNum, data)
-            # Display sending segment
-            print("Sending segment: ", segmentSend.to_string())
-            # Use the unreliable sendChannel to send the segment
-            self.sendChannel.send(segmentSend)
+            while True:
+                # if the counter is 0, this means we have sent a packet and need a new one
+                if counter == 0:
+                    # create new segment, reset data variable for new packet, and set new seqnum
+                    segmentSend = Segment()
+                    data = ''
+                    seqNum = self.charCount
+
+                # add char in dataToSend at index charCount into data variable
+                data += self.dataToSend[self.charCount]
+                # increment charCount to set to index in dataToSend that we need to send
+                # increment counter to make sure we are not going over the DATA_LENGTH limit
+                self.charCount += 1
+                counter += 1
+
+                # if the counter is equal to the data length then we have to send the packet
+                if counter == self.DATA_LENGTH:
+                    # reset counter
+                    counter = 0
+                    # sets up segment with data
+                    segmentSend.setData(seqNum, data)
+                    # make data empty so it doesn't send again if the char count is greater than the slidingwindow[1]
+                    data = ''
+                    # create a copy of segment for possible resend later and keeping track of packets acks
+                    copySegment = copy.deepcopy(segmentSend)
+                    # start delay iteration for the copy which is used for timeout retransmits
+                    copySegment.setStartDelayIteration(self.currentIteration)
+                    # Display sending segment
+                    print("Sending segment: ", segmentSend.to_string())
+                    # Use the unreliable sendChannel to send the segment
+                    self.sendChannel.send(segmentSend)
+                    # store copy of segment in case we need to resend, and to keep track of acks
+                    self.awaitingAckSegments.append(copySegment)
+
+                # if we pass the sliding window's upper range then we need to send the packet and break out of loop
+                if self.charCount > self.slidingWindow[1]:
+                    # if the current data variable is 0 then we have just sent a packet and we need to just exit the
+                    # loop. Else, we need to send the packet, it will also have a data size of less than DATA_LENGTH
+                    if len(data) > 0:
+                        # set up segment data
+                        segmentSend.setData(seqNum, data)
+                        # create deep copy of segment object
+                        copySegment = copy.deepcopy(segmentSend)
+                        # start delay iteration for the copy which is used for timeout retransmits
+                        copySegment.setStartDelayIteration(self.currentIteration)
+                        # send the segment
+                        print("Sending segment: ", segmentSend.to_string())
+                        self.sendChannel.send(segmentSend)
+                        # store copy of segment in case we need to resend, and to keep track of acks
+                        self.awaitingAckSegments.append(copySegment)
+                    # exit loop which finishes this iterations sending
+                    break
 
     # ################################################################################################################ #
     # processReceive()                                                                                                 #
@@ -190,9 +236,19 @@ class RDTLayer(object):
     #                                                                                                                  #
     # ################################################################################################################ #
     def processReceiveAndSendRespond(self):
-        print("Process Receive")
-        # This call returns a list of incoming segments (see Segment class)...
-        # receive() returns a list of all the sent packets
+        # print statments just used to see which part is doing what
+        if len(self.dataToSend) == 0:
+            print()
+            print("###############################################################################")
+            print("Server Process Receive from Reliable Layer")
+            print("###############################################################################")
+            print()
+        else:
+            print()
+            print("###############################################################################")
+            print("Client Process Receive from Reliable Layer")
+            print("###############################################################################")
+            print()
 
         # get packets from receive channel
         listIncomingSegments = self.receiveChannel.receive()
@@ -206,45 +262,111 @@ class RDTLayer(object):
         # loop through all the segments in the list incoming segments that have now been ordered
         for seg in listIncomingSegments:
 
-            seg.printToConsole()
-            # if the sequence number matches the ack number we are looking for then process it, if not then it
-            # is out of order, and we just put that segment into the receiving list history array to look at
-            # on the next processing, and skip this iteration.
-            if seg.seqnum > -1:
+            # if the checksum of current segment has an error then just completely disregard it like it was being
+            # dropped. If it is an ack it will be retransmitted, or if it is a data segment it will also be
+            # retransmitted
+            if not seg.checkChecksum():
+                continue
+
+            # if the current segment is not an ack segment then this will pertain to the server accepting data
+            if seg.seqnum > -1 and len(self.dataToSend) == 0:
+                # if the current packet is the packet we are looking for based on the acknum and seqnum, then we will
+                # process it
                 if seg.seqnum != self.ackNum:
-                    self.receivingListHistory.append(seg)
+                    # if segment is greater than the current ack number, then it is out of order and something we have
+                    # not yet processed
+                    if seg.seqnum > self.ackNum:
+                        # if it is not then we will put it into the receiving buffer receivingListHistory to be looked
+                        # at during the next iteration
+                        print("Putting in receiving buffer")
+                        self.receivingListHistory.append(seg)
+                    else:
+                        # if it is something we have already processed, this means that the ack packet was lost or
+                        #  delayed so, we will just retransmit the ack segment to the client
+                        segmentAck = Segment()
+                        segmentAck.setAck(seg.seqnum + len(seg.payload))
+                        self.sendChannel.send(segmentAck)
+                        print("Re-Sending ack: ", segmentAck.to_string())
                     continue
-
-                # #################################################################################################### #
-                # What segments have been received?
-                # How will you get them back in order?
-                # This is where a majority of your logic will be implemented
-
+                # if the packet is in the correct order then we print out the packet details
+                seg.printToConsole()
+                # add the data to our data received
                 self.dataReceived += seg.payload
-                # #################################################################################################### #
-                # How do you respond to what you have received?
-                # How can you tell data segments apart from ack segments?
+
                 segmentAck = Segment()  # Segment acknowledging packet(s) received
 
-                # Somewhere in here you will be setting the contents of the ack segments to send.
-                # The goal is to employ cumulative ack, just like TCP does...
-                print("Value we should be comparing it to")
+                # increment our ack number by the payload size
                 self.ackNum += len(seg.payload)
 
-                # #################################################################################################### #
                 # Display response segment
                 segmentAck.setAck(self.ackNum)
                 print("Sending ack: ", segmentAck.to_string())
 
                 # Use the unreliable sendChannel to send the ack packet
                 self.sendChannel.send(segmentAck)
+            # if the current segment is an ack segment then this will pertain to the client
+            else:
+                count = 0
+                # see if the ack packet we have will ack any of the packets we have awaiting to be ack'd
+                for awaitingSeg in self.awaitingAckSegments:
+                    # get the size of the awaiting segments payload
+                    sizeOfPayload = len(awaitingSeg.payload)
+                    # if the ack number of the ack segment matches the sequence number plus the payload size of the
+                    # segment that is awaiting an ack, then this ack indicates this segment was received
+                    if seg.acknum == awaitingSeg.seqnum + sizeOfPayload:
 
+                        # segLocation get the current awaitingSeg's seq number
+                        segLocation = self.awaitingAckSegments[count].seqnum
+
+                        # delete segment awaiting ack since ack was received
+                        del self.awaitingAckSegments[count]
+
+                        # checks to see if the packed that was deleted was the left most packet in the sliding window
+                        # since only when this packet is ack'd we will change the sliding window to move forward
+                        if segLocation == self.slidingWindow[0]:
+
+                            # if the packet we just ack'd was the last packet then this is a special case where
+                            # we move the whole sliding window by the size of the (self.FLOW_CONTROL_WIN_SIZE - 1)
+                            if len(self.awaitingAckSegments) == 0:
+                                # moves the lower part of the range to current self.charCount which is the variable
+                                # that points to the next char we need to send
+                                self.slidingWindow[0] = self.charCount
+                                # if adding (self.FLOW_CONTROL_WIN_SIZE - 1) to the self.charCount would be over the
+                                # length of the dataToSend then we would have errors since it would think there is more
+                                # data to send, so we set the upper range to the len(self.dataToSend) - 1 if this is
+                                # true, else we just increase by (self.FLOW_CONTROL_WIN_SIZE - 1)
+                                if self.charCount + (self.FLOW_CONTROL_WIN_SIZE - 1) > (len(self.dataToSend) - 1):
+                                    self.slidingWindow[1] = len(self.dataToSend) - 1
+                                else:
+                                    self.slidingWindow[1] = self.charCount + (self.FLOW_CONTROL_WIN_SIZE - 1)
+                            else:
+                                # else normally, if it was not the last ack, then we just need to move the range to the
+                                # next lowest segment awaiting to be ack'd.
+                                # upper calculates the difference between where the next segment char index is
+                                # and where it the sliding window lower range is currently, this will be added to the
+                                # upper range to make sure we stay withing the flow control window size
+                                upper = self.awaitingAckSegments[count].seqnum - self.slidingWindow[0]
+                                # set the new lower range of sliding window
+                                self.slidingWindow[0] = self.awaitingAckSegments[count].seqnum
+                                # if self.slidingWindow[1] + upper would be greater than the length of the data we have
+                                # to send then we just set to len(self.dataToSend) - 1
+                                if self.slidingWindow[1] + upper > (len(self.dataToSend) - 1):
+                                    self.slidingWindow[1] = len(self.dataToSend) - 1
+                                else:
+                                    self.slidingWindow[1] += upper
+                        # since we know that this ack segment acknowledged one of out data segments then we can break
+                        break
+                    # increments count
+                    count += 1
+
+    # https://www.geeksforgeeks.org/bubble-sort/ used this to just make sure my bubble sort worked correctly
     def segmentBubbleSort(self, arr):
         n = len(arr)
         swap = False
         # Traverse through all array elements
         for i in range(n - 1):
             for j in range(0, n - i - 1):
+                # sorts elements by their seqnum
                 if arr[j].seqnum > arr[j + 1].seqnum:
                     swap = True
                     arr[j], arr[j + 1] = arr[j + 1], arr[j]
